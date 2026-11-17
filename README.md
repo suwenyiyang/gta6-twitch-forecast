@@ -107,7 +107,7 @@ run time; no curve shape is hard-coded from memory.
 ## Validation (leave-one-out, honest out-of-sample)
 
 Measured with `test_local.py`, which scores the **shipped**
-`forecast_case()` on the kit's comparables: each console-only launch is
+`forecast()` on the kit's comparables: each console-only launch is
 held out in turn, forecast from the remaining comparables, and scored
 against its real release-day hours. (The same 7 console-only launches
 appear in each of the 4 practice cases, so 28 scorings of 7 launches.)
@@ -132,10 +132,10 @@ final are the persistence baseline and the house AI model (unknown
 score; it is made 2026-11-18 23:00 UTC).
 
 Local test results (2026-11-17, `python3 test_local.py --kit …`):
-synthetic-case format checks pass; each of p00–p03 is run in its own
-sandbox (as the grader runs it) and passes the shape checks; every case's
-two runs are byte-identical; each practice case runs in ~0.13 s (limit
-8 s per case); **ALL CHECKS PASSED**.
+the synthetic case and each of p00–p03 get their own sandbox and pass
+every shape rule; every case's two runs are byte-identical; each runs in
+~0.14 s (limit 8 s per case); a robustness pass over malformed cases
+still exits cleanly with a valid file; **ALL CHECKS PASSED**.
 
 ## Assumptions and limits (labelled as such)
 

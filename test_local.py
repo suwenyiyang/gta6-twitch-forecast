@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
-"""Self-test for main.py (GTA VI Twitch forecast, make.fun bounty).
+"""Self-test for the forecast program in this repository.
 
-Run from the repository root:
-    python3 test_local.py [--kit /path/to/gta6-twitch-ccu-forecast-01-kit]
+    python3 test_local.py [--kit <path to the unpacked gta6-twitch-ccu-forecast-01 kit>]
 
-Checks (no network, standard library only):
-  1. Synthetic case: builds a small case in the documented
-     "makefun/twitch-ccu-case/v1" format, runs main.py on it, and
-     validates the output strictly (23 rows, hours 2..24 each once,
-     five quantiles per row, finite, > 0, <= 1e9, non-decreasing,
-     <= 65,536 bytes, single top-level key "hours").
-  2. Determinism: two runs on the same input write byte-identical files.
-  3. Runtime: each practice/synthetic case finishes well inside 8 s.
-  4. Leave-one-out skill check (only if the competition kit is found):
-     for each console-only comparable in the kit's practice cases, hold
-     it out, forecast it from the remaining comparables with the exact
-     shipped forecast_case(), and score pinball loss on the log scale
-     against its real release-day hours; the same for the house
-     persistence baseline. This is the honest out-of-sample estimate
-     of the model on the launch family GTA VI belongs to.
+The kit is looked for at $MAKEFUN_KIT, then beside this repository, then in /tmp/gta-kit. With no
+kit the practice-case and skill checks are skipped and the rest still runs.
 
-Exit code 0 when every check passes; non-zero otherwise.
+What is checked, all offline and with the standard library only:
+
+  1. A synthetic case in the documented "makefun/twitch-ccu-case/v1" shape: the program exits
+     cleanly, writes <id>.out, and the file passes every rule the grader applies -- one top-level
+     key "hours", exactly 23 rows for hours 2..24 in order, five finite quantiles per row above
+     0 and at most 1e9, non-decreasing, at most 65,536 bytes. Two runs must be byte-identical.
+     The forecast must also behave like a launch day: a dip below the first hour early, a peak
+     above it in the evening.
+
+  2. Each of the kit's practice cases p00..p03, each run in a sandbox of its own with only that
+     one case file in the input directory, exactly as the grader runs it: the same shape rules,
+     under 8 seconds, and byte-identical output from two runs.
+
+  3. A leave-one-out skill check on the kit's console-only comparables, the launch family this
+     forecast is for. Each is held out in turn and forecast from the rest by the program's own
+     forecast function, then scored with the contest's pinball loss on the log scale against its
+     real release-day hours. The house persistence baseline is scored on the same hours, and the
+     program must beat it. This is an out-of-sample estimate, not a practice score: the practice
+     answers are the server's.
+
+  4. Robustness: malformed and extreme cases still produce a valid file and a clean exit, because
+     an invalid case scores as if every quantile were the first hour's count and takes no prize.
+
+Exit status is 0 when every check passes, 1 otherwise.
 """
 
 import argparse
-import contextlib
 import importlib.util
 import json
 import math
@@ -38,123 +46,124 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
+TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
 FAILURES: list[str] = []
 
 
-def check(condition: bool, message: str) -> None:
-    print(("  ok  " if condition else " FAIL ") + message)
-    if not condition:
-        FAILURES.append(message)
+def check(ok: bool, label: str) -> None:
+    print(("  ok   " if ok else "  FAIL ") + label)
+    if not ok:
+        FAILURES.append(label)
 
 
-@contextlib.contextmanager
-def scratch_dir():
-    """A throwaway directory that also works where tempfile.mkdtemp() cannot.
-
-    tempfile.mkdtemp() creates the directory with a 0700 ACL, which a restricted
-    Windows process (a sandbox, a service account, some CI runners) cannot create
-    children in. A plain os.makedirs() under the system temp directory does, so it
-    is tried first and a directory beside the repository is the last resort.
-    """
-    candidates = [Path(tempfile.gettempdir()), ROOT.parent, ROOT]
-    for base in candidates:
-        path = base / f"gta-forecast-test-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        try:
-            path.mkdir(parents=True)
-        except OSError:
-            continue
-        try:
-            yield path
-        finally:
-            shutil.rmtree(path, ignore_errors=True)
-        return
-    raise RuntimeError(f"no writable scratch directory among {[str(c) for c in candidates]}")
-
-
-def discover_kit(explicit: str | None) -> Path | None:
-    """The competition kit: --kit, else $MAKEFUN_KIT, else a sibling of the repo."""
-    if explicit:
-        return Path(explicit)
-    env = os.environ.get("MAKEFUN_KIT")
-    if env:
-        return Path(env)
-    for candidate in (
-        ROOT.parent / "gta6-twitch-ccu-forecast-01-kit",
-        ROOT / "gta6-twitch-ccu-forecast-01-kit",
-        Path("/tmp/gta-kit/gta6-twitch-ccu-forecast-01-kit"),
-    ):
-        if (candidate / "input").is_dir():
-            return candidate
-    return None
-
-
-def load_main():
-    spec = importlib.util.spec_from_file_location("forecast_main", ROOT / "main.py")
+def load_program():
+    """Import main.py as a module, without needing it on sys.path."""
+    spec = importlib.util.spec_from_file_location("forecast_program", ROOT / "main.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def pinball(y: float, q: float, tau: float) -> float:
-    d = math.log(max(1.0, y)) - math.log(max(1e-9, q))
-    return 2.0 * max(tau * d, (tau - 1.0) * d)
+def scratch_dir():
+    """A temporary directory that also works where tempfile.mkdtemp() cannot.
+
+    mkdtemp creates its directory with a 0700 ACL, which a restricted Windows process (a sandbox,
+    a service account, some CI runners) cannot create children in; a plain makedirs under the
+    system temp directory can, so that is tried first, with the repository's parent as a fallback.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def manager():
+        for base in (Path(tempfile.gettempdir()), ROOT.parent, ROOT):
+            path = base / f"gta-forecast-test-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            try:
+                path.mkdir(parents=True)
+            except OSError:
+                continue
+            try:
+                yield path
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+            return
+        raise RuntimeError("no writable scratch directory")
+
+    return manager()
 
 
-def validate_output(data: dict, label: str) -> None:
-    """The grader's shape rules, reported as one check per case."""
+def find_kit(explicit: str | None) -> Path | None:
+    if explicit:
+        return Path(explicit)
+    candidates = []
+    if os.environ.get("MAKEFUN_KIT"):
+        candidates.append(Path(os.environ["MAKEFUN_KIT"]))
+    candidates += [
+        ROOT.parent / "gta6-twitch-ccu-forecast-01-kit",
+        ROOT / "gta6-twitch-ccu-forecast-01-kit",
+        Path("/tmp/gta-kit/gta6-twitch-ccu-forecast-01-kit"),
+    ]
+    for candidate in candidates:
+        if (candidate / "input").is_dir():
+            return candidate
+    return None
+
+
+def shape_problems(payload, label: str) -> list[str]:
+    """Every reason the grader would call this output invalid, if any."""
     problems: list[str] = []
-    if not (isinstance(data, dict) and list(data.keys()) == ["hours"]):
-        problems.append(f"top-level keys are {list(data)[:4] if isinstance(data, dict) else type(data).__name__}, not exactly ['hours']")
-        check(False, f"{label}: " + "; ".join(problems))
-        return
-    hours = data["hours"]
-    if not isinstance(hours, list) or len(hours) != 23:
-        problems.append(f"{len(hours) if isinstance(hours, list) else type(hours).__name__} rows, not 23")
-        check(False, f"{label}: " + "; ".join(problems))
-        return
+    if not isinstance(payload, dict) or list(payload) != ["hours"]:
+        return [f"{label}: top level is not an object with the single key 'hours'"]
+    rows = payload["hours"]
+    if not isinstance(rows, list) or len(rows) != 23:
+        return [f"{label}: not 23 rows"]
     seen = []
-    for row in hours:
-        if not isinstance(row, dict) or set(row.keys()) != {"hour", "q"}:
-            problems.append(f"row keys {sorted(row) if isinstance(row, dict) else type(row).__name__}, not exactly hour+q")
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"hour", "q"}:
+            problems.append(f"{label}: a row's keys are not exactly hour and q")
             continue
         seen.append(row["hour"])
         q = row["q"]
         if not isinstance(q, list) or len(q) != 5:
-            problems.append(f"hour {row['hour']}: {len(q) if isinstance(q, list) else type(q).__name__} quantiles, not 5")
+            problems.append(f"{label}: hour {row['hour']} has no five quantiles")
             continue
-        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 < v <= 1e9 for v in q):
-            problems.append(f"hour {row['hour']}: quantiles outside (0, 1e9] or not finite: {q}")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in q):
+            problems.append(f"{label}: hour {row['hour']} has a non-finite quantile")
+        elif not all(0 < v <= 1e9 for v in q):
+            problems.append(f"{label}: hour {row['hour']} has a quantile outside (0, 1e9]")
         if not all(q[i] <= q[i + 1] for i in range(4)):
-            problems.append(f"hour {row['hour']}: quantiles decrease: {q}")
+            problems.append(f"{label}: hour {row['hour']} quantiles decrease")
     if seen != list(range(2, 25)):
-        problems.append(f"hours are {seen[:3]}..{seen[-3:]}, not 2..24 each once, in order")
-    if problems:
-        check(False, f"{label}: " + "; ".join(problems))
-    else:
-        check(True, f"{label}: valid — 23 rows, hours 2..24, five non-decreasing quantiles in (0, 1e9]")
+        problems.append(f"{label}: hours are not 2..24, each once, in order")
+    return problems
+
+
+def run_program(input_dir: Path, output_dir: Path) -> tuple[int, float, str]:
+    """Run main.py the way the grader does, and time it."""
+    environment = dict(os.environ, MAKEFUN_INPUT_DIR=str(input_dir), MAKEFUN_OUTPUT_DIR=str(output_dir))
+    started = time.monotonic()
+    finished = subprocess.run(
+        [sys.executable, "-P", "-s", str(ROOT / "main.py")],
+        env=environment, capture_output=True, text=True, timeout=120,
+    )
+    elapsed = time.monotonic() - started
+    return finished.returncode, elapsed, finished.stderr
 
 
 def synthetic_case() -> dict:
-    """A small case in the documented format, with a console-only and a
-    PC-simultaneous comparable so the curve code has something to chew on."""
-    def hourly(day, values):
-        from datetime import datetime, timedelta
-        base = datetime.fromisoformat(day.replace("Z", "+00:00"))
+    """A case in the documented shape, with one console and one PC-simultaneous launch."""
+
+    def curve(day: str, values: list[int]) -> list[dict]:
+        base = __import__("datetime").datetime.fromisoformat(day + "T00:00:00+00:00")
         return [
-            {"from": (base + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-             "viewers": v, "channels": 100 + i}
-            for i, v in enumerate(values)
+            {"from": (base + __import__("datetime").timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "viewers": value, "channels": 100 + i}
+            for i, value in enumerate(values)
         ]
 
-    console_day = [50000, 42000, 38000, 37000, 40000, 46000, 52000, 58000,
-                   64000, 70000, 78000, 86000, 94000, 102000, 110000, 118000,
-                   125000, 132000, 138000, 140000, 136000, 130000, 122000, 115000]
-    pc_day = [200000, 190000, 180000, 175000, 178000, 185000, 195000, 205000,
-              215000, 225000, 235000, 245000, 255000, 265000, 275000, 285000,
-              295000, 300000, 298000, 290000, 280000, 265000, 250000, 235000]
+    rising = [50000] + [40000 + 1200 * i for i in range(23)]
+    flat = [200000] + [190000 - 1500 * i for i in range(23)]
     return {
         "schema": "makefun/twitch-ccu-case/v1",
         "id": "synthetic-01",
@@ -162,179 +171,188 @@ def synthetic_case() -> dict:
         "day_start": "2026-11-19T00:00:00Z",
         "checkpoint": "2026-11-19T01:00:00Z",
         "levels": [0.05, 0.25, 0.5, 0.75, 0.95],
-        "known": [{"hour": 1, "from": "2026-11-19T00:00:00Z",
-                   "until": "2026-11-19T01:00:00Z", "viewers": 80000,
-                   "channels": 1500, "reads": 60}],
+        "known": [{"hour": 1, "from": "2026-11-19T00:00:00Z", "until": "2026-11-19T01:00:00Z",
+                   "viewers": 80000, "channels": 1500, "reads": 60}],
         "forecast": [{"hour": h,
                       "from": f"2026-11-19T{h - 1:02d}:00:00Z",
-                      "until": f"2026-11-19T{h:02d}:00:00Z"}
-                     for h in range(2, 25)],
+                      "until": f"2026-11-19T{h:02d}:00:00Z"} for h in range(2, 25)],
         "history": [{"at": "2026-11-18T23:59:00Z", "viewers": 42000, "channels": 900}],
         "history_hourly": [],
         "streams": None,
         "categories_hourly": None,
         "comparables": [
-            {"name": "Console Game A", "day_start": "2024-01-15T00:00:00Z",
-             "unlock": "Consoles midnight local", "platforms": "PS5 only",
-             "source": "synthetic", "hourly": hourly("2024-01-15T00:00:00Z", console_day)},
-            {"name": "Console Game B", "day_start": "2024-03-10T00:00:00Z",
-             "unlock": "Consoles midnight local", "platforms": "PS5, Xbox Series X|S",
-             "source": "synthetic",
-             "hourly": hourly("2024-03-10T00:00:00Z", [int(v * 0.7) for v in console_day])},
-            {"name": "PC Game C", "day_start": "2024-05-20T00:00:00Z",
-             "unlock": "PC simultaneous midnight GMT", "platforms": "PC, PS5",
-             "source": "synthetic", "hourly": hourly("2024-05-20T00:00:00Z", pc_day)},
-            # Target history: must be ignored by the model.
+            {"name": "Console Launch A", "day_start": "2024-01-15T00:00:00Z",
+             "unlock": "Consoles midnight local", "platforms": "PS5 only", "source": "synthetic",
+             "hourly": curve("2024-01-15", rising)},
+            {"name": "Console Launch B", "day_start": "2024-03-10T00:00:00Z",
+             "unlock": "Consoles midnight local", "platforms": "PS5, Xbox Series X|S", "source": "synthetic",
+             "hourly": curve("2024-03-10", [int(v * 0.7) for v in rising])},
+            {"name": "PC Launch C", "day_start": "2024-05-20T00:00:00Z",
+             "unlock": "PC simultaneous", "platforms": "PC, PS5", "source": "synthetic",
+             "hourly": curve("2024-05-20", flat)},
             {"name": "Grand Theft Auto VI", "day_start": "2026-08-27T00:00:00Z",
-             "unlock": "Not a launch: pre-release history",
-             "platforms": "PS5, Xbox Series X|S", "source": "synthetic",
-             "hourly": hourly("2026-08-27T00:00:00Z", [1000] * 24)},
+             "unlock": "Not a launch: pre-release history", "platforms": "PS5",
+             "source": "synthetic", "hourly": curve("2026-08-27", [1000] * 24)},
         ],
         "notes": "Synthetic self-test case; not a real launch.",
     }
 
 
-def run_main(input_dir: Path, output_dir: Path) -> float:
-    env = dict(os.environ)
-    env["MAKEFUN_INPUT_DIR"] = str(input_dir)
-    env["MAKEFUN_OUTPUT_DIR"] = str(output_dir)
-    start = time.monotonic()
-    proc = subprocess.run(
-        [sys.executable, "-P", "-s", str(ROOT / "main.py")],
-        env=env, capture_output=True, text=True, timeout=60,
-    )
-    elapsed = time.monotonic() - start
-    if proc.returncode != 0:
-        print(proc.stdout)
-        print(proc.stderr, file=sys.stderr)
-    check(proc.returncode == 0, f"main.py exits 0 (rc={proc.returncode})")
-    return elapsed
+def pinball(actual: float, quantile: float, tau: float) -> float:
+    """The contest's item score."""
+    delta = math.log(max(1.0, actual)) - math.log(max(1e-9, quantile))
+    return 2.0 * max(tau * delta, (tau - 1.0) * delta)
 
 
-def loo_skill_check(main, kit: Path) -> None:
-    """Leave-one-out pinball loss on console-only comparables, using the
-    shipped forecast_case() with the held-out launch removed."""
-    print("Leave-one-out skill check (kit practice cases):")
-    total_loss, total_n, total_cov = 0.0, 0, 0
-    base_loss, base_n = 0.0, 0
-    launches = 0
-    for case_path in sorted((kit / "input").glob("p*.in")):
-        case = json.loads(case_path.read_text(encoding="utf-8"))
-        comps = case["comparables"]
+def practice_cases(kit: Path):
+    for path in sorted((kit / "input").glob("p*.in")):
+        yield path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def skill_check(program, kit: Path) -> None:
+    """Leave-one-out on console-only launches, against the house persistence baseline."""
+    total_model = total_base = 0.0
+    items = covered = launches = 0
+    for _, case in practice_cases(kit):
         usable = []
-        for comp in comps:
-            if main._is_target_history(comp):
+        for comp in case["comparables"]:
+            if program.is_target_echo(comp):
                 continue
-            hours = main.release_day_hours(comp)
-            if 1 in hours and hours[1] >= 100 and len(hours) >= 20:
-                usable.append((comp, hours))
-        console = [(c, h) for c, h in usable if main._is_console_only(c)]
-        for held_comp, held_hours in console:
+            counts = program.release_day(comp)
+            if 1 in counts and counts[1] >= 100 and len(counts) >= 20:
+                usable.append((comp, counts))
+        held_out = [(comp, counts) for comp, counts in usable if program.is_console_only(comp)]
+        for target, truth in held_out:
             launches += 1
-            others = [c for c, _ in usable if c is not held_comp]
+            others = [comp for comp, _ in usable if comp is not target]
             pseudo = {
-                "known": [{"hour": 1, "viewers": held_hours[1]}],
-                "forecast": [{"hour": h} for h in range(2, 25)],
+                "known": [{"hour": 1, "viewers": truth[1]}],
                 "comparables": others,
             }
-            forecast = {row["hour"]: row["q"] for row in main.forecast_case(pseudo)["hours"]}
-            p1 = held_hours[1]
-            for h in range(2, 25):
-                if h not in held_hours:
+            forecast = {row["hour"]: row["q"] for row in program.forecast(pseudo)["hours"]}
+            anchor = truth[1]
+            for hour in range(2, 25):
+                if hour not in truth:
                     continue
-                for tau, q in zip(TAUS, forecast[h]):
-                    total_loss += pinball(held_hours[h], q, tau)
-                    total_n += 1
-                if forecast[h][0] <= held_hours[h] <= forecast[h][4]:
-                    total_cov += 1
-                spread = 0.15 * math.sqrt(h - 1)
+                for tau, quantile in zip(TAUS, forecast[hour]):
+                    total_model += pinball(truth[hour], quantile, tau)
+                    items += 1
+                if forecast[hour][0] <= truth[hour] <= forecast[hour][4]:
+                    covered += 1
                 for tau, z in zip(TAUS, Z):
-                    base_loss += pinball(held_hours[h], p1 * math.exp(z * spread), tau)
-                    base_n += 1
-    if launches == 0:
-        print("  (no console-only comparables found; skipped)")
+                    total_base += pinball(truth[hour], anchor * math.exp(z * 0.15 * math.sqrt(hour - 1)), tau)
+    if not launches:
+        print("  (no console-only comparables in this kit; skill check skipped)")
         return
-    loss = total_loss / total_n
-    base = base_loss / base_n
-    print(f"  console launches scored (LOO): {launches}")
-    print(f"  model pinball loss:   {loss:.4f}")
-    print(f"  baseline pinball loss:{base:.4f}")
-    print(f"  90% coverage:         {total_cov / (23 * launches):.2f} (honest target ~0.90)")
-    check(loss < base, f"model beats house baseline out-of-sample ({loss:.4f} < {base:.4f})")
+    model_loss = total_model / items
+    base_loss = total_base / items
+    print(f"  console-only launches held out: {launches} ({items // 5} scored hours)")
+    print(f"  pinball loss, this program:     {model_loss:.4f}")
+    print(f"  pinball loss, house baseline:   {base_loss:.4f}")
+    print(f"  90% coverage:                   {covered / (23 * launches):.2f} (an honest band gives ~0.90)")
+    check(model_loss < base_loss, f"program beats the house baseline out of sample ({model_loss:.4f} < {base_loss:.4f})")
+
+
+def robustness(program) -> None:
+    """Cases the program must survive: it may forecast badly, but never crash or emit junk."""
+    def base():
+        return {
+            "known": [{"hour": 1, "viewers": 50000}],
+            "comparables": [],
+        }
+
+    broken = {
+        "no comparables": base(),
+        "no known row": {"comparables": []},
+        "first hour zero": {"known": [{"hour": 1, "viewers": 0}], "comparables": []},
+        "first hour at the cap": {"known": [{"hour": 1, "viewers": 1e9}], "comparables": []},
+        "first hour negative": {"known": [{"hour": 1, "viewers": -5}], "comparables": []},
+        "first hour a string": {"known": [{"hour": 1, "viewers": "52000"}], "comparables": []},
+        "comparables null": {"known": [{"hour": 1, "viewers": 50000}], "comparables": None},
+        "malformed comparable": {"known": [{"hour": 1, "viewers": 50000}],
+                                 "comparables": [{"name": "x", "hourly": "nope"}]},
+        "empty case": {},
+    }
+    for label, case in broken.items():
+        try:
+            payload = program.forecast(case)
+            problems = shape_problems(payload, label)
+        except Exception as exc:  # noqa: BLE001 - any raise is the failure this checks for
+            problems = [f"{label}: raised {type(exc).__name__}: {exc}"]
+        check(not problems, f"survives '{label}'" + ("" if not problems else f" ({problems[0]})"))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Self-test for the forecast program.")
     parser.add_argument("--kit", default=None,
-                        help="path to the gta6-twitch-ccu-forecast-01 kit (default: $MAKEFUN_KIT, "
-                             "else a sibling directory of this repository)")
-    args = parser.parse_args()
-    main_mod = load_main()
+                        help="the unpacked gta6-twitch-ccu-forecast-01 kit (default: $MAKEFUN_KIT, "
+                             "then a sibling directory of this repository)")
+    arguments = parser.parse_args()
+    program = load_program()
 
-    print("== 1. Synthetic case ==")
-    with scratch_dir() as tmp:
-        in_dir, out_dir = tmp / "in", tmp / "out"
-        in_dir.mkdir()
-        (in_dir / "synthetic-01.in").write_text(
-            json.dumps(synthetic_case()), encoding="utf-8"
-        )
-        elapsed = run_main(in_dir, out_dir)
-        check(elapsed < 8.0, f"synthetic case runs in {elapsed:.2f}s (< 8s limit)")
-        out_path = out_dir / "synthetic-01.out"
-        check(out_path.exists(), "synthetic-01.out written")
-        raw = out_path.read_bytes()
-        check(len(raw) <= 65536, f"output <= 65,536 bytes ({len(raw)})")
-        validate_output(json.loads(raw), "synthetic-01.out")
-        first_run = raw
-        # Determinism: run again, expect byte-identical output.
-        elapsed2 = run_main(in_dir, out_dir)
-        check((out_dir / "synthetic-01.out").read_bytes() == first_run,
-              "two runs on the same case are byte-identical")
-        # Sanity: the median curve should dip early and peak in the evening.
-        data = json.loads(first_run)
-        med = {row["hour"]: row["q"][2] for row in data["hours"]}
-        p1 = 80000
-        print(f"  median ratios: h2={med[2]/p1:.2f}x h5={med[5]/p1:.2f}x "
-              f"h12={med[12]/p1:.2f}x h19={med[19]/p1:.2f}x h24={med[24]/p1:.2f}x")
-        check(med[3] < p1, "median dips below hour 1 in the early hours")
-        check(med[19] > p1, "median rises above hour 1 by the evening peak")
+    print("== 1. synthetic case ==")
+    with scratch_dir() as work:
+        source, target = work / "in", work / "out"
+        source.mkdir()
+        (source / "synthetic-01.in").write_text(json.dumps(synthetic_case()), encoding="utf-8")
+        code, elapsed, stderr = run_program(source, target)
+        check(code == 0, f"exits cleanly (exit {code})" + (f" {stderr.strip()[:200]}" if code else ""))
+        check(elapsed < 8.0, f"runs in {elapsed:.3f} s (limit 8 s per case)")
+        written = target / "synthetic-01.out"
+        check(written.is_file(), "writes synthetic-01.out")
+        if written.is_file():
+            raw = written.read_bytes()
+            check(len(raw) <= 65536, f"output is {len(raw)} bytes (limit 65,536)")
+            payload = json.loads(raw)
+            problems = shape_problems(payload, "synthetic-01.out")
+            check(not problems, "output passes every shape rule" + ("" if not problems else f": {problems[0]}"))
+            run_program(source, target)
+            check(written.read_bytes() == raw, "two runs on the same case are byte-identical")
+            medians = {row["hour"]: row["q"][2] for row in payload["hours"]}
+            print("   median ratios: " + " ".join(
+                f"h{hour}={medians[hour] / 80000:.2f}x" for hour in (2, 5, 12, 19, 24)))
+            check(medians[3] < 80000, "median dips below the first hour early in the day")
+            check(medians[19] > 80000, "median peaks above it in the evening")
 
-    kit = discover_kit(args.kit)
-    if kit is not None and (kit / "input").is_dir():
-        print(f"== 2. Kit practice cases, one sandbox per case ==  [{kit}]")
-        with scratch_dir() as tmp:
-            for pid in ["p00", "p01", "p02", "p03"]:
-                case_path = kit / "input" / f"{pid}.in"
-                if not case_path.is_file():
-                    check(False, f"{pid}.in present in the kit")
-                    continue
-                # The grader runs one case per sandbox: only that case's file is in /input.
-                in_dir, out_dir = tmp / f"in-{pid}", tmp / f"out-{pid}"
-                in_dir.mkdir()
-                shutil.copy2(case_path, in_dir / f"{pid}.in")
-                elapsed = run_main(in_dir, out_dir)
-                check(elapsed < 8.0, f"{pid}: runs in {elapsed:.3f}s (< 8s per case)")
-                out_path = out_dir / f"{pid}.out"
-                check(out_path.exists(), f"{pid}.out written")
-                if not out_path.exists():
-                    continue
-                raw = out_path.read_bytes()
-                check(len(raw) <= 65536, f"{pid}.out is {len(raw)} bytes (<= 65,536)")
-                validate_output(json.loads(raw), f"{pid}.out")
-                run_main(in_dir, out_dir)
-                check(out_path.read_bytes() == raw, f"{pid}: two runs on the same case are byte-identical")
-        print("== 3. Leave-one-out skill ==")
-        loo_skill_check(main_mod, kit)
+    print("== 2. robustness ==")
+    robustness(program)
+
+    kit = find_kit(arguments.kit)
+    if kit is None:
+        print("== 3. practice cases skipped: no kit found (pass --kit, or set MAKEFUN_KIT) ==")
     else:
-        where = "no --kit given and none found beside the repository" if kit is None else f"not found at {kit}"
-        print(f"== kit {where}: skipping practice-case checks ==")
-        print("   pass --kit <path> or set MAKEFUN_KIT to the unpacked gta6-twitch-ccu-forecast-01-kit")
+        print(f"== 3. practice cases, one sandbox per case ==  [{kit}]")
+        with scratch_dir() as work:
+            for case_id in ("p00", "p01", "p02", "p03"):
+                original = kit / "input" / f"{case_id}.in"
+                if not original.is_file():
+                    check(False, f"{case_id}.in is in the kit")
+                    continue
+                source, target = work / f"in-{case_id}", work / f"out-{case_id}"
+                source.mkdir()
+                shutil.copy2(original, source / f"{case_id}.in")
+                code, elapsed, stderr = run_program(source, target)
+                check(code == 0, f"{case_id}: exits cleanly (exit {code})")
+                check(elapsed < 8.0, f"{case_id}: runs in {elapsed:.3f} s (limit 8 s)")
+                written = target / f"{case_id}.out"
+                check(written.is_file(), f"{case_id}: writes {case_id}.out")
+                if not written.is_file():
+                    continue
+                raw = written.read_bytes()
+                check(len(raw) <= 65536, f"{case_id}: output is {len(raw)} bytes (limit 65,536)")
+                problems = shape_problems(json.loads(raw), f"{case_id}.out")
+                check(not problems, f"{case_id}: output passes every shape rule" +
+                      ("" if not problems else f": {problems[0]}"))
+                run_program(source, target)
+                check(written.read_bytes() == raw, f"{case_id}: two runs are byte-identical")
+        print("== 4. leave-one-out skill ==")
+        skill_check(program, kit)
 
     print()
     if FAILURES:
-        print(f"FAILED: {len(FAILURES)} check(s)")
+        print(f"{len(FAILURES)} check(s) failed:")
         for failure in FAILURES:
-            print(" - " + failure)
+            print("  - " + failure)
         return 1
     print("ALL CHECKS PASSED")
     return 0

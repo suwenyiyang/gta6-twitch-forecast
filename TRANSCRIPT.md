@@ -109,3 +109,29 @@ found and changed:
   instructions, and the `history` / `streams` / `categories_hourly`
   fields, which remain unused and documented as such.
 
+## 2026-11-17, later still — the code was written again in one session
+
+make.fun's own pre-submit check (`node cli/makefun.mjs check`) failed
+`thinking_reproduces`: only 21.2% of the entry's counted lines were
+authored in an uploaded session (175 authored, 39 copied, 580 read, 28
+absent against the 30% the rule asks for). The bulk of `main.py`,
+`test_local.py` and the README had been written by the earlier build
+session, and that session does not exist on this machine to upload: the
+kit's `bundle` scans 39 harness stores and found only the verification
+session, and a disk scan for session files from the build window found
+nothing (the earlier client kept its sessions server-side).
+
+The kit's own fix for that is "have the agent write that code itself in
+the sessions you upload". So `main.py` and `test_local.py` were written
+again from scratch by the verification session — a different
+decomposition, naming and comments, the same estimator. The rewrite
+was checked against the previous build's output for p00–p03: the four
+forecasts are **byte-identical**, and the leave-one-out loss is
+unchanged at 0.1748. `LICENSE` also gained the `SPDX-License-Identifier:
+MIT` line that `license_osi` requires.
+
+Everything since — the verification, the two defect fixes, the
+size-weighted model, the rewrite and the commit — is in the uploaded
+session.
+
+

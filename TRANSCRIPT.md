@@ -65,3 +65,47 @@
 - The entry was not graded by make.fun's server; the numbers above are
   local leave-one-out estimates on the kit's comparables, not practice
   scores and not a promise about the final.
+
+## 2026-11-17, later — verification pass (second session)
+
+A second agent session re-downloaded the kit, re-read `RULES.txt` and
+`starter/main.py`, and verified this repository against them. What it
+found and changed:
+
+- **Format.** `main.py` was already correct on the documented contract
+  (reads every `*.in` in `$MAKEFUN_INPUT_DIR` / `/input`, writes
+  `/output/<id>.out`, 23 rows, five non-decreasing quantiles in
+  `(0, 1e9]`, under 65,536 bytes, no network, standard library only).
+  Verified on p00–p03, each run in its own sandbox with only its case.
+- **Two real defects, fixed.**
+  1. `baseline_quantiles()` — the fallback used when a case has no
+     usable comparables — had no `1e9` clamp, so a (hypothetical)
+     hour-1 print near 1e9 produced quantiles above the cap and an
+     invalid case. Clamping is now shared by both quantile builders
+     (`_clamp_row`).
+  2. If a case's `forecast` list repeated an hour or held an
+     out-of-range one, the output grew to 24 rows. The output now
+     always carries exactly hours 2–24, whatever that list says.
+  A 15-case robustness pass (missing `known`, hour 1 of 0 / 1e9 /
+  negative / a string, null and zero viewers, malformed comparables, a
+  case that is a JSON list, …) now yields a valid `.out` and exit 0
+  for every one.
+- **Model.** Leave-one-out over the kit's comparables showed the
+  unweighted median could be improved a lot by weighting comparables
+  by how close their launch size is to the target's (bandwidth 1.3 in
+  log viewers), since launch size drives shape. On the 7 console-only
+  launches: 0.2176 → 0.1814; over all 37 useful launches: 0.842 →
+  0.432. Shading the console IQR by 0.85 (it is measured
+  unconditionally, the median is now conditional) takes the console
+  score to **0.1748** with 0.95 coverage. The house persistence
+  baseline scores 0.3245 on the same launches.
+- **test_local.py.** Now runs each practice case in its own sandbox
+  like the grader, checks two-run byte-identity per case, aggregates
+  the shape check per case, discovers the kit automatically
+  (`--kit`, `$MAKEFUN_KIT`, or a sibling directory), and no longer
+  depends on `tempfile.mkdtemp()` (whose 0700 ACL fails under a
+  restricted Windows process).
+- **Not changed:** the I/O contract, the LICENSE, the submission
+  instructions, and the `history` / `streams` / `categories_hourly`
+  fields, which remain unused and documented as such.
+

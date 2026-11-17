@@ -67,24 +67,33 @@ run time; no curve shape is hard-coded from memory.
 1. **Anchor.** `p1` = the case's known hour-1 print (00:00–01:00 UTC).
    Everything is a ratio to `p1`, so the forecast adapts to whatever
    hour 1 actually was.
-2. **Median curve.** For each usable comparable, divide its release-day
-   hourly viewers by its own hour-1 print and take logs. The **median**
-   log-ratio over **all** usable comparables is the median curve. Its
-   shape, measured on the kit's data: a dip to ~0.75× in hours 2–5
-   (deep night in Europe, US not yet unlocked), a slow climb as the US
-   unlocks (east coast 05:00 UTC, west coast 08:00 UTC), a peak of
-   ~2.0–2.4× in hours 19–20 (US afternoon/evening + EU evening prime
-   time), easing to ~2.0× by hour 24. Using all comparables (n ≈ 37)
-   instead of only console-only ones (n = 7) makes the median far more
-   stable, and leave-one-out scoring prefers it.
+2. **Median curve, weighted by launch size.** For each usable
+   comparable, divide its release-day hourly viewers by its own hour-1
+   print and take logs. The median log-ratio is a **weighted median**,
+   weighted by a Gaussian kernel on log launch size (bandwidth 1.3):
+   comparables whose first hour was close in size to the target's
+   dominate; ones two orders of magnitude away count almost nothing.
+   Size is what decides shape — a 20k-viewer console launch grows to
+   ~2.7× its first hour by 19:00 UTC, a 900k launch opens near its
+   peak and decays (0.9× at hour 2, 0.55× by hour 8, ~1.25× at 19:00).
+   An unweighted median over the same 37 launches scores 0.214 in
+   leave-one-out on console launches; the size-weighted one scores
+   0.181, and it also fixes the degenerate small-hour-1 launches
+   (Silksong, ARC Raiders: hour 1 is pre-unlock and ~150–1,400 viewers).
 3. **Spread.** The honest uncertainty for a console-only rolling-midnight
    launch is much narrower than the spread across all launch types
    (PC-simultaneous launches have a totally different shape). So the
    log-spread comes from the **console-only** comparables (platforms
    with no PC — the family GTA VI belongs to, PS5 + Xbox Series X|S):
    the inter-quartile robust sigma of their log-ratios, plus the
-   standard error of the median, plus a horizon term:
-   `s_h = clamp(sqrt(σ² + (σ/√n)² + (0.08·√(h−1))²), 0.25, 1.0)`.
+   standard error of the median, plus a horizon term, plus a term for
+   how far the target's first hour sits above every comparable (the
+   further out on the size axis, the less the data can say):
+   `s_h = clamp(sqrt(σ² + (σ/√n)² + (0.08·√(h−1))² + (0.10·excess)²), 0.25, 1.0)`,
+   `excess = max(0, ln p1 − max_comparable ln(hour 1))`, with `σ` the
+   console IQR shaded by 0.85 — the IQR is measured across launches of
+   every size, and conditioning the median on size leaves less residual
+   spread than that.
    Quantiles are lognormal around the median:
    `q_τ(h) = p1 · exp(m_h + z_τ · s_h)`, `z = [-1.645, -0.674, 0, 0.674, 1.645]`.
 4. **Exclusions.** GTA VI's own pre-release history (tier
@@ -105,8 +114,15 @@ appear in each of the 4 practice cases, so 28 scorings of 7 launches.)
 
 | | Pinball loss (log scale) | 90% coverage |
 |---|---|---|
-| This model | **0.2176** | 0.93 |
+| This model (size-weighted median) | **0.1748** | 0.95 |
+| …before the 0.85 spread shading | 0.1814 | 0.96 |
+| This model's earlier unweighted median | 0.2176 | 0.93 |
 | House persistence baseline (same launches) | 0.3245 | — |
+
+Feeding that back: the weighting is a real effect, not noise — run over
+**every** comparable launch (not just console ones) the same swap takes
+the loss from 0.842 to 0.432, because the unweighted median was being
+dragged by launches whose hour 1 was still pre-unlock.
 
 For reference, the house baseline scores ~0.387 on the four practice
 cases (per the kit's RULES.txt), with typical miss ~82.8% and 90%
@@ -115,9 +131,11 @@ evidence, not a promise. The two baselines that must be beaten on the
 final are the persistence baseline and the house AI model (unknown
 score; it is made 2026-11-18 23:00 UTC).
 
-Local test results (2026-11-17, `python3 test_local.py`):
-synthetic-case format checks pass; two runs byte-identical; 4 practice
-cases run in 0.17 s total (limit 8 s per case); **ALL CHECKS PASSED**.
+Local test results (2026-11-17, `python3 test_local.py --kit …`):
+synthetic-case format checks pass; each of p00–p03 is run in its own
+sandbox (as the grader runs it) and passes the shape checks; every case's
+two runs are byte-identical; each practice case runs in ~0.13 s (limit
+8 s per case); **ALL CHECKS PASSED**.
 
 ## Assumptions and limits (labelled as such)
 

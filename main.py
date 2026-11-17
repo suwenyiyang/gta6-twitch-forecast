@@ -33,38 +33,43 @@ run time -- nothing about the curve is hard-coded from memory:
 
 2. Median curve: for each comparable, take its release-day hourly
    viewers, divide by its own hour-1 print, and take logs. The median
-   log-ratio over ALL usable comparables is the forecast's median curve.
-   It has the shape a launch day actually has: a dip to ~0.75x in hours
-   2-5 (deep night in Europe, US not yet unlocked), a slow climb as the
-   US unlocks (05:00 UTC east coast, 08:00 UTC west coast), and a peak
-   of ~2.0-2.4x in hours 19-20 (US afternoon/evening + EU evening prime
-   time), easing to ~2.0x by hour 24. Using all comparables (n ~ 37)
-   instead of only console-only ones (n = 7) makes the median far more
-   stable; leave-one-out scoring on the console-only launches (the
-   family GTA VI belongs to) prefers the all-launches median.
+   log-ratio is a WEIGHTED median, weighted by a Gaussian kernel on
+   log launch size (bandwidth 1.3): a comparable whose first hour was
+   as big as the target's counts most, one two orders of magnitude
+   away nearly nothing. Size drives shape -- a 20k-viewer console
+   launch climbs to several times its first hour by prime time, a
+   900k launch opens near its peak and decays -- so this is what makes
+   one program serve a small practice case and a GTA VI-sized final
+   alike. The target's own pre-release history is excluded.
 
 3. Spread: the honest uncertainty for a console-only rolling-midnight
    launch is much narrower than the spread across all launch types
    (PC-simultaneous launches have a totally different shape). So the
    log-spread s_h comes from the CONSOLE-ONLY comparables (platforms
-   with no PC): the inter-quartile robust sigma of their log-ratios,
-   plus the standard error of the median, plus a horizon term that
-   widens the band as the forecast reaches further into the day:
+   with no PC). Their inter-quartile robust sigma is measured across
+   launches of every size, so it is shaded down by 0.85 now that the
+   median is conditioned on size -- what is left is
        s_h = clamp(sqrt(sigma_c^2 + (sigma_c/sqrt(n_c))^2
-                        + (0.08*sqrt(h-1))^2), 0.25, 1.0)
+                        + (0.08*sqrt(h-1))^2
+                        + (0.10*excess)^2), 0.25, 1.0)
+   with sigma_c the shaded console IQR and excess how far the target's
+   first hour sits above every comparable: the further out on the size
+   axis, the less the data can say.
    Quantiles are lognormal around the median:
        q_tau(h) = p1 * exp(m_h + z_tau * s_h),
    z = [-1.645, -0.674, 0, 0.674, 1.645] for tau = 5/25/50/75/95%.
 
-4. The target's own pre-release history (the "Grand Theft Auto VI"
-   comparable, tier "target-history") is NOT a launch and is excluded,
-   as is any comparable without a usable release day.
+4. Exclusions: the target's own pre-release history (the "Grand Theft
+   Auto VI" comparable, tier "target-history") is not a launch and is
+   excluded, as is any comparable without a usable release day (hour-1
+   print under 100 viewers, or fewer than 20 of its 24 hours present).
 
 Scoring: pinball loss on the log scale. Leave-one-out validation on the
-7 console-only comparables in the practice kit: this model 0.210 vs the
-house persistence baseline 0.325 (same launches); 90% coverage 0.94.
-The house baseline scores ~0.387 on the four practice cases. The final
-is a different day, so no number here promises a final score.
+7 console-only comparables in the practice kit, scoring the shipped
+forecast_case() with each launch held out in turn: this model 0.175 vs
+the house persistence baseline 0.325 on the same launches; 90% coverage
+0.95. The house baseline scores ~0.387 on the four practice cases. The
+final is a different day, so no number here promises a final score.
 
 Determinism and safety: no randomness, no clock, no network, no file
 writes besides the outputs; inputs are read in name order. If anything
@@ -100,6 +105,11 @@ BASELINE_SIGMA = 0.15
 SPREAD_FLOOR = 0.25
 SPREAD_CAP = 1.0
 HORIZON_SIGMA = 0.08
+SIZE_BANDWIDTH = 1.3      # log-viewers bandwidth of the launch-size kernel
+EXTRAPOLATION_SIGMA = 0.10  # extra spread per log unit the target exceeds every comparable
+# The console IQR is measured across launches of every size; conditioning the median on launch
+# size leaves less residual spread than that unconditional IQR, so shade it down.
+CONSOLE_SIGMA_SCALE = 0.85
 MIN_HOUR1_VIEWERS = 100   # a comparable needs a real hour-1 print
 MIN_RELEASE_HOURS = 20    # ... and a mostly complete release day
 
@@ -158,12 +168,6 @@ def release_day_hours(comp: dict) -> dict[int, float]:
     return hours
 
 
-def _median_log_ratio(ratios: list[float]) -> float | None:
-    if len(ratios) < 3:
-        return None
-    return statistics.median(ratios)
-
-
 def _robust_sigma(ratios: list[float]) -> tuple[float, int] | tuple[None, int]:
     """Inter-quartile robust sigma of log-ratios, and the sample size."""
     n = len(ratios)
@@ -175,12 +179,43 @@ def _robust_sigma(ratios: list[float]) -> tuple[float, int] | tuple[None, int]:
     return max(0.15, (q3 - q1) / 1.349), n
 
 
-def build_curve(comparables: list[dict]) -> dict[int, tuple[float, float]]:
+def _kernel_weights(p1: float, sizes: list[float]) -> list[float]:
+    """Gaussian kernel on log launch size: a comparable as big as the target counts most.
+
+    Launch size drives the shape: a 20k-viewer console launch rises to several times its first
+    hour by prime time, a 900k launch opens near its peak and decays. Weighting by how close a
+    comparable's hour-1 print is to the target's, in log space, is what makes the median curve
+    adapt to the target's scale. Shifted by the smallest distance first so no weight underflows.
+    """
+    if not sizes:
+        return []
+    target = math.log(max(1.0, p1))
+    d2 = [(math.log(max(1.0, size)) - target) ** 2 for size in sizes]
+    floor = min(d2)
+    return [math.exp(-0.5 * (value - floor) / (SIZE_BANDWIDTH ** 2)) for value in d2]
+
+
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    """The value where the cumulative weight first passes half the total."""
+    total = sum(weights)
+    if total <= 0.0:
+        return statistics.median(values)
+    pairs = sorted(zip(values, weights))
+    accumulated = 0.0
+    for value, weight in pairs:
+        accumulated += weight
+        if accumulated >= total / 2.0:
+            return value
+    return pairs[-1][0]
+
+
+def build_curve(comparables: list[dict], p1: float) -> dict[int, tuple[float, float]]:
     """Return {hour: (median log-ratio to hour 1, log spread)} for h=2..24.
 
-    Median from ALL usable comparables (stable, n ~ 37); spread from the
-    console-only subset (honest conditional uncertainty for a console
-    launch), plus the median's standard error and a horizon term.
+    Median from ALL usable comparables, weighted towards launches of a similar size (so a
+    GTA VI-sized first hour is forecast from GTA VI-sized launches); spread from the
+    console-only subset (honest conditional uncertainty for a console launch), plus the
+    median's standard error, a horizon term and an extrapolation term.
     """
     usable: list[dict[int, float]] = []
     console: list[dict[int, float]] = []
@@ -196,51 +231,65 @@ def build_curve(comparables: list[dict]) -> dict[int, tuple[float, float]]:
         if _is_console_only(comp):
             console.append(hours)
 
+    if not usable:
+        return {}
+
+    sizes = [hours[1] for hours in usable]
+    weights = _kernel_weights(p1, sizes)
+    # How far, in log viewers, the target's first hour sits above every comparable it has:
+    # the further out, the less the comparables can say, so the band has to widen.
+    excess = max(0.0, math.log(max(1.0, p1)) - max(math.log(size) for size in sizes))
+
     curve: dict[int, tuple[float, float]] = {}
     for hour in range(2, 25):
-        all_ratios = [
-            math.log(hours[hour] / hours[1]) for hours in usable if hour in hours
-        ]
-        median = _median_log_ratio(all_ratios)
-        if median is None:
-            median = 0.0
+        rows = [(hours, weight) for hours, weight in zip(usable, weights) if hour in hours]
+        values = [math.log(hours[hour] / hours[1]) for hours, _ in rows]
+        median = _weighted_median(values, [weight for _, weight in rows]) if values else 0.0
         sigma_c, n_c = _robust_sigma(
             [math.log(hours[hour] / hours[1]) for hours in console if hour in hours]
         )
         if sigma_c is None:
             # Too few console launches for this hour: fall back to the
             # all-launches spread, then to a plain 0.30.
-            sigma_c, n_c = _robust_sigma(all_ratios)
+            sigma_c, n_c = _robust_sigma(values)
             if sigma_c is None:
                 sigma_c, n_c = 0.30, 1
+        sigma_c *= CONSOLE_SIGMA_SCALE
         spread = math.sqrt(
             sigma_c * sigma_c
             + (sigma_c / math.sqrt(max(1, n_c))) ** 2
             + (HORIZON_SIGMA * math.sqrt(hour - 1)) ** 2
+            + (EXTRAPOLATION_SIGMA * excess) ** 2
         )
         spread = min(max(spread, SPREAD_FLOOR), SPREAD_CAP)
         curve[hour] = (median, spread)
     return curve
 
 
+def _clamp_row(values: list[float]) -> list[float | int]:
+    """One output row: finite, above 0, at most 1e9, non-decreasing, rounded to 2 decimals."""
+    out: list[float | int] = []
+    previous = 0.0
+    for value in values:
+        if not math.isfinite(value):  # a NaN or an infinity from a pathological case
+            value = 1e9 if value > 0 else 0.01
+        value = min(max(value, 0.01), 1e9)
+        value = max(value, previous)
+        rounded = round2(value)
+        out.append(rounded)
+        previous = float(rounded)
+    return out
+
+
 def baseline_quantiles(p1: float, hour: int) -> list[float | int]:
     """House persistence baseline: flat at p1, spread 0.15*sqrt(h-1)."""
     spread = BASELINE_SIGMA * math.sqrt(hour - 1)
-    return [round2(p1 * math.exp(z * spread)) for z in Z]
+    return _clamp_row([p1 * math.exp(z * spread) for z in Z])
 
 
 def hour_quantiles(p1: float, hour: int, curve: dict[int, tuple[float, float]]) -> list[float | int]:
     median, spread = curve.get(hour, (0.0, BASELINE_SIGMA * math.sqrt(hour - 1)))
-    values = [p1 * math.exp(median + z * spread) for z in Z]
-    # Clamp to the contest's (0, 1e9] and keep the row non-decreasing.
-    out: list[float | int] = []
-    previous = 0.0
-    for value in values:
-        value = min(max(value, 0.01), 1e9)
-        value = max(value, previous)
-        out.append(round2(value))
-        previous = float(out[-1])
-    return out
+    return _clamp_row([p1 * math.exp(median + z * spread) for z in Z])
 
 
 def hour1_print(case: dict) -> float:
@@ -264,27 +313,15 @@ def hour1_print(case: dict) -> float:
 def forecast_case(case: dict) -> dict:
     p1 = hour1_print(case)
     try:
-        curve = build_curve(case.get("comparables") or [])
+        curve = build_curve(case.get("comparables") or [], p1)
     except Exception:
         curve = {}
-    hours = []
-    for row in case.get("forecast") or []:
-        hour = row.get("hour")
-        if not isinstance(hour, int) or not 2 <= hour <= 24:
-            continue
-        if curve:
-            quantiles = hour_quantiles(p1, hour, curve)
-        else:
-            quantiles = baseline_quantiles(p1, hour)
-        hours.append({"hour": hour, "q": quantiles})
-    # Guarantee exactly hours 2..24, in order, whatever the case listed.
-    seen = {row["hour"] for row in hours}
-    for hour in range(2, 25):
-        if hour not in seen:
-            hours.append(
-                {"hour": hour, "q": hour_quantiles(p1, hour, curve) if curve else baseline_quantiles(p1, hour)}
-            )
-    hours.sort(key=lambda row: row["hour"])
+    # Always exactly hours 2..24, each once, whatever the case's `forecast` list says: the
+    # output shape is fixed by the rules, so a malformed list must not shrink or duplicate it.
+    hours = [
+        {"hour": hour, "q": hour_quantiles(p1, hour, curve) if curve else baseline_quantiles(p1, hour)}
+        for hour in range(2, 25)
+    ]
     return {"hours": hours}
 
 

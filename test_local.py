@@ -24,14 +24,17 @@ Exit code 0 when every check passes; non-zero otherwise.
 """
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +50,47 @@ def check(condition: bool, message: str) -> None:
         FAILURES.append(message)
 
 
+@contextlib.contextmanager
+def scratch_dir():
+    """A throwaway directory that also works where tempfile.mkdtemp() cannot.
+
+    tempfile.mkdtemp() creates the directory with a 0700 ACL, which a restricted
+    Windows process (a sandbox, a service account, some CI runners) cannot create
+    children in. A plain os.makedirs() under the system temp directory does, so it
+    is tried first and a directory beside the repository is the last resort.
+    """
+    candidates = [Path(tempfile.gettempdir()), ROOT.parent, ROOT]
+    for base in candidates:
+        path = base / f"gta-forecast-test-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        try:
+            path.mkdir(parents=True)
+        except OSError:
+            continue
+        try:
+            yield path
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+        return
+    raise RuntimeError(f"no writable scratch directory among {[str(c) for c in candidates]}")
+
+
+def discover_kit(explicit: str | None) -> Path | None:
+    """The competition kit: --kit, else $MAKEFUN_KIT, else a sibling of the repo."""
+    if explicit:
+        return Path(explicit)
+    env = os.environ.get("MAKEFUN_KIT")
+    if env:
+        return Path(env)
+    for candidate in (
+        ROOT.parent / "gta6-twitch-ccu-forecast-01-kit",
+        ROOT / "gta6-twitch-ccu-forecast-01-kit",
+        Path("/tmp/gta-kit/gta6-twitch-ccu-forecast-01-kit"),
+    ):
+        if (candidate / "input").is_dir():
+            return candidate
+    return None
+
+
 def load_main():
     spec = importlib.util.spec_from_file_location("forecast_main", ROOT / "main.py")
     module = importlib.util.module_from_spec(spec)
@@ -60,22 +104,37 @@ def pinball(y: float, q: float, tau: float) -> float:
 
 
 def validate_output(data: dict, label: str) -> None:
-    check(isinstance(data, dict) and list(data.keys()) == ["hours"], f"{label}: single top-level key 'hours'")
-    hours = data.get("hours")
-    check(isinstance(hours, list) and len(hours) == 23, f"{label}: exactly 23 rows")
-    if not isinstance(hours, list):
+    """The grader's shape rules, reported as one check per case."""
+    problems: list[str] = []
+    if not (isinstance(data, dict) and list(data.keys()) == ["hours"]):
+        problems.append(f"top-level keys are {list(data)[:4] if isinstance(data, dict) else type(data).__name__}, not exactly ['hours']")
+        check(False, f"{label}: " + "; ".join(problems))
+        return
+    hours = data["hours"]
+    if not isinstance(hours, list) or len(hours) != 23:
+        problems.append(f"{len(hours) if isinstance(hours, list) else type(hours).__name__} rows, not 23")
+        check(False, f"{label}: " + "; ".join(problems))
         return
     seen = []
     for row in hours:
-        check(set(row.keys()) == {"hour", "q"}, f"{label}: row keys are exactly hour+q (hour {row.get('hour')})")
-        seen.append(row.get("hour"))
-        q = row.get("q")
-        check(isinstance(q, list) and len(q) == 5, f"{label}: hour {row.get('hour')} has five quantiles")
-        if isinstance(q, list) and len(q) == 5:
-            ok = all(isinstance(v, (int, float)) and math.isfinite(v) and 0 < v <= 1e9 for v in q)
-            check(ok, f"{label}: hour {row.get('hour')} quantiles finite, in (0, 1e9]")
-            check(all(q[i] <= q[i + 1] for i in range(4)), f"{label}: hour {row.get('hour')} quantiles non-decreasing")
-    check(seen == list(range(2, 25)), f"{label}: hours 2..24 each once, in order")
+        if not isinstance(row, dict) or set(row.keys()) != {"hour", "q"}:
+            problems.append(f"row keys {sorted(row) if isinstance(row, dict) else type(row).__name__}, not exactly hour+q")
+            continue
+        seen.append(row["hour"])
+        q = row["q"]
+        if not isinstance(q, list) or len(q) != 5:
+            problems.append(f"hour {row['hour']}: {len(q) if isinstance(q, list) else type(q).__name__} quantiles, not 5")
+            continue
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 < v <= 1e9 for v in q):
+            problems.append(f"hour {row['hour']}: quantiles outside (0, 1e9] or not finite: {q}")
+        if not all(q[i] <= q[i + 1] for i in range(4)):
+            problems.append(f"hour {row['hour']}: quantiles decrease: {q}")
+    if seen != list(range(2, 25)):
+        problems.append(f"hours are {seen[:3]}..{seen[-3:]}, not 2..24 each once, in order")
+    if problems:
+        check(False, f"{label}: " + "; ".join(problems))
+    else:
+        check(True, f"{label}: valid — 23 rows, hours 2..24, five non-decreasing quantiles in (0, 1e9]")
 
 
 def synthetic_case() -> dict:
@@ -206,13 +265,14 @@ def loo_skill_check(main, kit: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kit", default="/tmp/gta-kit/gta6-twitch-ccu-forecast-01-kit")
+    parser.add_argument("--kit", default=None,
+                        help="path to the gta6-twitch-ccu-forecast-01 kit (default: $MAKEFUN_KIT, "
+                             "else a sibling directory of this repository)")
     args = parser.parse_args()
     main_mod = load_main()
 
     print("== 1. Synthetic case ==")
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
+    with scratch_dir() as tmp:
         in_dir, out_dir = tmp / "in", tmp / "out"
         in_dir.mkdir()
         (in_dir / "synthetic-01.in").write_text(
@@ -239,23 +299,36 @@ def main() -> int:
         check(med[3] < p1, "median dips below hour 1 in the early hours")
         check(med[19] > p1, "median rises above hour 1 by the evening peak")
 
-    kit = Path(args.kit)
-    if (kit / "input").is_dir():
-        print("== 2. Kit practice cases (format + timing) ==")
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            out_dir = tmp / "out"
-            elapsed = run_main(kit / "input", out_dir)
+    kit = discover_kit(args.kit)
+    if kit is not None and (kit / "input").is_dir():
+        print(f"== 2. Kit practice cases, one sandbox per case ==  [{kit}]")
+        with scratch_dir() as tmp:
             for pid in ["p00", "p01", "p02", "p03"]:
+                case_path = kit / "input" / f"{pid}.in"
+                if not case_path.is_file():
+                    check(False, f"{pid}.in present in the kit")
+                    continue
+                # The grader runs one case per sandbox: only that case's file is in /input.
+                in_dir, out_dir = tmp / f"in-{pid}", tmp / f"out-{pid}"
+                in_dir.mkdir()
+                shutil.copy2(case_path, in_dir / f"{pid}.in")
+                elapsed = run_main(in_dir, out_dir)
+                check(elapsed < 8.0, f"{pid}: runs in {elapsed:.3f}s (< 8s per case)")
                 out_path = out_dir / f"{pid}.out"
                 check(out_path.exists(), f"{pid}.out written")
-                if out_path.exists():
-                    validate_output(json.loads(out_path.read_text()), f"{pid}.out")
-            check(elapsed < 8.0, f"4 practice cases run in {elapsed:.2f}s total (< 8s per case)")
+                if not out_path.exists():
+                    continue
+                raw = out_path.read_bytes()
+                check(len(raw) <= 65536, f"{pid}.out is {len(raw)} bytes (<= 65,536)")
+                validate_output(json.loads(raw), f"{pid}.out")
+                run_main(in_dir, out_dir)
+                check(out_path.read_bytes() == raw, f"{pid}: two runs on the same case are byte-identical")
         print("== 3. Leave-one-out skill ==")
         loo_skill_check(main_mod, kit)
     else:
-        print(f"== kit not found at {kit}; skipping practice-case checks ==")
+        where = "no --kit given and none found beside the repository" if kit is None else f"not found at {kit}"
+        print(f"== kit {where}: skipping practice-case checks ==")
+        print("   pass --kit <path> or set MAKEFUN_KIT to the unpacked gta6-twitch-ccu-forecast-01-kit")
 
     print()
     if FAILURES:

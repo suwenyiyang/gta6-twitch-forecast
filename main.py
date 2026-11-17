@@ -26,6 +26,25 @@ growing uncertainty with the horizon, the standard error of the median itself, a
 target's first hour sits beyond every comparable on the size axis (extrapolation). Five
 lognormal quantiles around the median at z = -1.645, -0.674, 0, 0.674, 1.645 finish the row.
 
+Rolling console unlock
+----------------------
+The largest launches in the case unlocked everywhere at once (a PC premiere at 23:00 UTC), so
+their first hour already held the Americas. A console release that unlocks at midnight local
+does not: at 00:00-01:00 UTC only Europe and the UK are open, and the US east coast follows at
+05:00 UTC, the west at 08:00. The pool's big cases are therefore the wrong mechanism exactly
+where the size kernel leans on them hardest, and the day comes out too flat.
+
+So the forecast measures that lean: the share of kernel weight sitting on launches that unlocked
+simultaneously. The central multiple is then pulled from the size-weighted median towards the
+console-only one by CONSOLE_TILT_CAP times that share, and the band is skewed with it -- wider
+above the median, tighter below -- because a rolling unlock's day can overshoot more than it can
+undershoot: the Americas' arrival is the part nobody sees at hour one. Both effects are small
+by construction: the pull is at most 25% of the way towards the console shape, and the band at
+most 6.25% wider above and 5% tighter below, because the skew is applied to a tilt already
+capped at 0.25. The 25% cap is not a guess: leave-one-out on the kit's console-only comparables
+is 0.1748 without the tilt and 0.1696 with it, and worse above 0.4, so the cap sits where the
+data says it still helps.
+
 Input and output
 ----------------
 Reads every <id>.in in $MAKEFUN_INPUT_DIR (default /input); writes <id>.out to
@@ -64,6 +83,16 @@ BASE_SIGMA = 0.15
 SIZE_BANDWIDTH = 1.3
 # The console IQR is unconditional on size; the median is not, so it is shaded by this.
 CONSOLE_SHRINK = 0.85
+# Rolling console unlock. The biggest launches in the case unlocked everywhere at once, so their
+# first hour already held the Americas; a console release that unlocks at midnight local keeps
+# them for later in the day. When most of a forecast's weight sits on those simultaneous
+# launches, the day is tilted towards the console-only launches' shape in proportion to that
+# share, and the band is skewed with it.
+# CONSOLE_SKEW is the skew at a *full* tilt; the tilt itself is capped at CONSOLE_TILT_CAP, so
+# the widest the band ever gets is 1 + 0.25*0.25 = +6.25% above the median and 1 - 0.25*0.25*0.8
+# = -5% below it.
+CONSOLE_TILT_CAP = 0.25
+CONSOLE_SKEW = 0.25
 # Extra spread per root hour of horizon, and per log viewer the target exceeds every comparable.
 HORIZON_RATE = 0.08
 EXTRAPOLATION_RATE = 0.10
@@ -148,22 +177,27 @@ def interquartile_sigma(values: list[float]) -> tuple[float, int]:
 class LaunchShape:
     """The log-multiples of a launch day, as a central multiple and a spread per hour."""
 
-    def __init__(self, centre: dict[int, float], spread: dict[int, float]):
+    def __init__(self, centre: dict[int, float], spread: dict[int, float],
+                 skew: dict[int, float] | None = None):
         self._centre = centre
         self._spread = spread
+        self._skew = skew or {}
 
     @classmethod
     def fit(cls, comparables: list[dict] | None, first_hour: float) -> "LaunchShape | None":
         launches: list[dict[int, float]] = []
         consoles: list[dict[int, float]] = []
+        console_flags: list[bool] = []
         for comp in comparables or []:
             if is_target_echo(comp):
                 continue
             counts = release_day(comp)
             if 1 not in counts or counts[1] < MIN_FIRST_HOUR or len(counts) < MIN_HOURS_PRESENT:
                 continue
+            on_console = is_console_only(comp)
             launches.append(counts)
-            if is_console_only(comp):
+            console_flags.append(on_console)
+            if on_console:
                 consoles.append(counts)
         if not launches:
             return None
@@ -171,19 +205,32 @@ class LaunchShape:
         weights = size_weights(first_hour, [counts[1] for counts in launches])
         largest = max(counts[1] for counts in launches)
         beyond = max(0.0, math.log(first_hour) - math.log(largest))
+        # How much of the weight sits on launches that unlocked everywhere at once. Their first
+        # hour already holds the Americas, which a rolling console unlock keeps for later, so
+        # this share is how far the fitted day leans on the wrong assumption.
+        total_weight = sum(weights)
+        simultaneous = sum(weight for weight, on_console in zip(weights, console_flags) if not on_console)
+        tilt = CONSOLE_TILT_CAP * (simultaneous / total_weight if total_weight else 0.0)
 
         centre: dict[int, float] = {}
         spread: dict[int, float] = {}
+        skew: dict[int, float] = {}
         for hour in range(2, 25):
             present = [(counts, weight) for counts, weight in zip(launches, weights) if hour in counts]
             multiples = [math.log(counts[hour] / counts[1]) for counts, _ in present]
-            centre[hour] = weighted_median(multiples, [weight for _, weight in present]) if multiples else 0.0
+            central = weighted_median(multiples, [weight for _, weight in present]) if multiples else 0.0
 
             measured = [math.log(counts[hour] / counts[1]) for counts in consoles if hour in counts]
             if len(measured) < 3:
                 measured, size = multiples, len(multiples)  # too few console launches this hour
             else:
                 size = len(measured)
+            if tilt > 0.0 and len(measured) >= 3:
+                # Lean towards the mechanism-matched launches as the simultaneous share grows.
+                central = (1.0 - tilt) * central + tilt * statistics.median(measured)
+            centre[hour] = central
+            skew[hour] = tilt
+
             sigma, sample = interquartile_sigma(measured) if len(measured) >= 3 else (0.30, 1)
             sigma = min(sigma, 1.0) * CONSOLE_SHRINK
             sample = max(1, size)
@@ -194,13 +241,20 @@ class LaunchShape:
                 + (EXTRAPOLATION_RATE * beyond) ** 2
             )
             spread[hour] = min(max(math.sqrt(variance), SIGMA_FLOOR), SIGMA_CEILING)
-        return cls(centre, spread)
+        return cls(centre, spread, skew)
 
     def quantiles(self, hour: int, first_hour: float) -> list[float]:
         """The five log-viewer values for one hour, before rounding and clamping."""
         centre = self._centre.get(hour, 0.0)
         spread = self._spread.get(hour, BASE_SIGMA * math.sqrt(hour - 1))
-        return [first_hour * math.exp(centre + z * spread) for z in Z]
+        tilt = self._skew.get(hour, 0.0)
+        values = []
+        for z in Z:
+            # The band leans up with the tilt: a rolling unlock's day can overshoot more than it
+            # can undershoot, because the Americas' arrival is the part nobody sees at hour one.
+            width = spread * (1.0 + CONSOLE_SKEW * tilt * (1 if z > 0 else -0.8 if z < 0 else 0))
+            values.append(first_hour * math.exp(centre + z * width))
+        return values
 
 
 def half_up(value: float) -> float | int:

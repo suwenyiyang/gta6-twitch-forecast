@@ -134,4 +134,36 @@ Everything since — the verification, the two defect fixes, the
 size-weighted model, the rewrite and the commit — is in the uploaded
 session.
 
+## 2026-11-17, second entry — the rolling unlock
+
+The entry above (commit 4945a272, submission 01a1e98d) stays on the
+board and is not replaced. A second entry fixes one mechanism the first
+one got wrong by construction.
+
+The largest launches in the case are PC premieres that unlocked
+everywhere at once, so their 00:00–01:00 UTC hour already contained the
+Americas. GTA VI is a console release that unlocks at midnight local:
+at 00:00–01:00 UTC only Europe and the UK are open, the US east coast
+follows at 05:00 and the west at 08:00. Where the size kernel leans on
+those simultaneous launches — which is exactly what it does for a
+seven-figure first hour — the day comes out too flat.
+
+The fix measures that lean rather than assuming it: the share of kernel
+weight sitting on launches that unlocked simultaneously. The central
+multiple is pulled that far towards the console-only shape, capped at
+25%, and the band is skewed with it — wider above the median, tighter
+below, at most 6.25% and 5% respectively, because the skew applies to a
+tilt already capped. The cap was not chosen by hand: leave-one-out on
+the kit's console-only comparables gives 0.1748 without the tilt, 0.1696
+at 0.25, 0.1707 at 0.40 and 0.1735 at 0.50, so 0.25 is where the tilt
+still pays. No practice answer was used at any point.
+
+A second entry is a *replacement*, not an extra ticket: the rules make the
+last submission before the deadline the entry that is graded, so this one
+supersedes 4945a272. If it ever looks worse, the earlier commit can be
+submitted again before the deadline and becomes the final entry once more,
+at the cost of one more submission.
+
+
+
 

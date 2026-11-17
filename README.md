@@ -99,11 +99,21 @@ run time; no curve shape is hard-coded from memory.
    spread than that.
    Quantiles are lognormal around the median:
    `q_τ(h) = p1 · exp(m_h + z_τ · s_h)`, `z = [-1.645, -0.674, 0, 0.674, 1.645]`.
-4. **Exclusions.** GTA VI's own pre-release history (tier
+4. **Rolling console unlock.** The biggest comparables unlocked everywhere at once (a PC
+   premiere at 23:00 UTC), so their hour 1 already held the Americas. A console release that
+   unlocks at midnight local does not — at 00:00–01:00 UTC only Europe and the UK are open, with
+   the US east coast at 05:00 UTC and the west at 08:00. Where the size kernel leans on those
+   simultaneous launches, the day comes out too flat. So the forecast measures the lean — the
+   kernel-weight share sitting on simultaneous launches — and pulls the central multiple that
+   far towards the console-only shape, capped at 25%, skewing the band with it — wider above the
+   median, tighter below, at most **6.25%** and **5%** respectively, since the skew applies to a
+   tilt that is already capped. The cap is set by leave-one-out, not by hand:
+   **0.1748 without the tilt, 0.1696 with it, worse above 0.4.**
+5. **Exclusions.** GTA VI's own pre-release history (tier
    `target-history`) is not a launch and is excluded; so is any
    comparable without a usable release day (hour-1 print < 100 viewers
    or fewer than 20 of 24 hours present).
-5. **Safety.** If anything about a case is unusable, the program still
+6. **Safety.** If anything about a case is unusable, the program still
    writes a valid forecast (the house persistence baseline) instead of
    crashing.
 
@@ -117,7 +127,8 @@ appear in each of the 4 practice cases, so 28 scorings of 7 launches.)
 
 | | Pinball loss (log scale) | 90% coverage |
 |---|---|---|
-| This model (size-weighted median) | **0.1748** | 0.95 |
+| This model (size-weighted median + rolling-unlock tilt) | **0.1696** | 0.95 |
+| …without the rolling-unlock tilt | 0.1748 | 0.95 |
 | …before the 0.85 spread shading | 0.1814 | 0.96 |
 | This model's earlier unweighted median | 0.2176 | 0.93 |
 | House persistence baseline (same launches) | 0.3245 | — |
